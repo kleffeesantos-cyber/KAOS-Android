@@ -15,8 +15,10 @@ jobs:
           java-version: 17
       - name: Aceitar licenças do SDK
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-      - name: Instalar CMake 3.18.1
-        run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.18.1"
+      - name: Instalar CMake e NDK
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.18.1"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973"
       - name: Compilar
         run: |
           chmod +x gradlew
