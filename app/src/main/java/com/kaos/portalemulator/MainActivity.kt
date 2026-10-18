@@ -27,6 +27,8 @@ class MainActivity : AppCompatActivity() {
     private var daemonProcess: Process? = null
     private var daemonReady = false
     private var allReady = false
+    private var daemonStdin: java.io.OutputStream? = null
+    private val daemonCmdExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private external fun nativeInit(): Int
     private external fun nativeSetSlotFile(slot: Int, path: String): Int
@@ -218,6 +220,9 @@ class MainActivity : AppCompatActivity() {
         val result = nativeLoadSlot(currentSlotIndex)
         if (result == 0) {
             slots[currentSlotIndex].loaded = true
+            slots[currentSlotIndex].file?.let {
+                sendDaemonCommand("LOAD $currentSlotIndex ${toRootPath(it.absolutePath)}")
+            }
             updateSlotDisplay()
             Toast.makeText(this, "Slot ${currentSlotIndex + 1} loaded", Toast.LENGTH_SHORT).show()
         } else {
@@ -229,11 +234,62 @@ class MainActivity : AppCompatActivity() {
         val result = nativeUnloadSlot(currentSlotIndex)
         if (result == 0) {
             slots[currentSlotIndex].loaded = false
+            sendDaemonCommand("UNLOAD $currentSlotIndex")
             updateSlotDisplay()
             Toast.makeText(this, "Slot ${currentSlotIndex + 1} unloaded", Toast.LENGTH_SHORT).show()
         } else {
             Toast.makeText(this, "Failed to unload slot", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    // ---- Comunicacao com o daemon (stdin) e controle do processo ----
+
+    // O daemon roda como root e nao ve o /sdcard do app; usa o caminho real em /data/media/0
+    private fun toRootPath(p: String): String = when {
+        p.startsWith("/sdcard/") -> "/data/media/0/" + p.removePrefix("/sdcard/")
+        p.startsWith("/storage/emulated/0/") -> "/data/media/0/" + p.removePrefix("/storage/emulated/0/")
+        else -> p
+    }
+
+    private fun sendDaemonCommand(line: String) {
+        daemonCmdExecutor.execute {
+            try {
+                val out = daemonStdin
+                if (out == null) {
+                    Log.d(TAG, "Daemon nao esta rodando, comando guardado: $line")
+                    return@execute
+                }
+                out.write((line + "\n").toByteArray())
+                out.flush()
+                Log.d(TAG, "-> daemon: $line")
+            } catch (e: Exception) {
+                Log.w(TAG, "Falha ao enviar comando ao daemon: ${e.message}")
+            }
+        }
+    }
+
+    // Reenvia os slots carregados (chamado quando o daemon inicia)
+    private fun syncSlotsToDaemon() {
+        for (slot in slots) {
+            val f = slot.file
+            if (slot.loaded && f != null) {
+                sendDaemonCommand("LOAD ${slot.index} ${toRootPath(f.absolutePath)}")
+            }
+        }
+    }
+
+    // destroy() so mata o "su", nao o daemon; mata o daemon pelo nome
+    private fun killDaemon() {
+        try {
+            Runtime.getRuntime().exec(arrayOf(
+                "su", "-c",
+                "killall portal_daemon 2>/dev/null; sleep 0.3; killall -9 portal_daemon 2>/dev/null; true"
+            ))
+        } catch (e: Exception) {
+            Log.w(TAG, "killDaemon: ${e.message}")
+        }
+        try { daemonProcess?.destroy() } catch (e: Exception) { Log.w(TAG, "destroy: ${e.message}") }
+        daemonStdin = null
     }
 
     private fun startGadget() {
@@ -252,6 +308,10 @@ class MainActivity : AppCompatActivity() {
                 // ========================================
                 // STEP 1: Clean up any existing state
                 // ========================================
+                // Mata daemon que sobrou de execucao anterior (senao segura o ep0 e o executavel)
+                killDaemon()
+                Thread.sleep(800)
+
                 Log.d(TAG, "Step 1: Cleaning up any existing gadget")
                 runRootScriptWithLogging(getGadgetCleanupScript())
                 Thread.sleep(500)
@@ -422,6 +482,9 @@ class MainActivity : AppCompatActivity() {
                     "nice -n -20 ${daemonDest.absolutePath} 2>/data/local/tmp/portal_daemon_err.log"
                 ))
 
+                daemonStdin = daemonProcess!!.outputStream
+                syncSlotsToDaemon()
+
                 // Monitor daemon output
                 val reader = daemonProcess!!.inputStream.bufferedReader()
                 daemonReady = false
@@ -466,7 +529,7 @@ class MainActivity : AppCompatActivity() {
                         showError("Timeout: Daemon failed to initialize ep0")
                         resetStartButton()
                     }
-                    daemonProcess?.destroy()
+                    killDaemon()
                     cleanupFunctionFS()
                     return@Thread
                 }
@@ -515,13 +578,17 @@ class MainActivity : AppCompatActivity() {
 
                 val (bindResult, bindOutput) = runRootScriptWithOutput(bindScript)
                 Log.d(TAG, "Bind result (exit=$bindResult):\n$bindOutput")
+                val (_, diag) = runRootScriptWithOutput(
+                    "cat /config/usb_gadget/kaos_portal/UDC; cat /sys/class/udc/*/state; dmesg | tail -15"
+                )
+                Log.d(TAG, "Diagnostico pos-bind:\n$diag")
 
                 if (bindResult != 0 || !bindOutput.contains("SUCCESS")) {
                     runOnUiThread {
                         showError("Failed to bind to UDC:\n$bindOutput")
                         resetStartButton()
                     }
-                    daemonProcess?.destroy()
+                    killDaemon()
                     cleanupFunctionFS()
                     return@Thread
                 }
@@ -572,7 +639,7 @@ class MainActivity : AppCompatActivity() {
                         Toast.makeText(this, "✓ Gadget started! Connect USB to host.", Toast.LENGTH_LONG).show()
                     } else {
                         showError("Timeout: Data endpoints failed to initialize")
-                        daemonProcess?.destroy()
+                        killDaemon()
                         cleanupFunctionFS()
                         resetStartButton()
                     }
@@ -587,7 +654,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 try {
                     unbindUdc()
-                    daemonProcess?.destroy()
+                    killDaemon()
                     cleanupFunctionFS()
                 } catch (cleanupEx: Exception) {
                     Log.e(TAG, "Error during cleanup", cleanupEx)
@@ -630,14 +697,14 @@ class MainActivity : AppCompatActivity() {
                 // STEP 2: Stop native emulator thread
                 // ========================================
                 Log.d(TAG, "Stopping daemon...")
-                daemonProcess?.destroy()
+                killDaemon()
                 daemonProcess = null
 
                 // ========================================
                 // STEP 3: Cleanup native state
                 // ========================================
                 Log.d(TAG, "Step 3: Cleaning up native state...")
-                daemonProcess?.destroy()
+                killDaemon()
                 Thread.sleep(300)
 
                 // ========================================
@@ -723,7 +790,7 @@ class MainActivity : AppCompatActivity() {
             .setMessage("This will restore normal USB functionality. Continue?")
             .setPositiveButton("Yes") { _, _ ->
                 Thread {
-                    daemonProcess?.destroy()
+                    killDaemon()
                     val (cleanupResult, cleanupOutput) = runRootScriptWithOutput(getGadgetCleanupScript())
 
                     Log.d(TAG, "Cleanup result: $cleanupOutput")
@@ -987,7 +1054,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         if (gadgetActive) {
-            daemonProcess?.destroy()
+            killDaemon()
         }
     }
 }
